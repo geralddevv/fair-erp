@@ -28,7 +28,7 @@ const sachikoDatasheetSchema = new mongoose.Schema(
 const SachikoDatasheet = mongoose.model(
   "SachikoDatasheet",
   sachikoDatasheetSchema,
-  "sachikodatasheets",
+  "datasheets",
 );
 
 export default SachikoDatasheet;

@@ -50,7 +50,7 @@ const sachikoJobcardSchema = new mongoose.Schema(
 const SachikoJobcard = mongoose.model(
   "SachikoJobcard",
   sachikoJobcardSchema,
-  "sachikojobcards",
+  "jobcards",
 );
 
 export default SachikoJobcard;

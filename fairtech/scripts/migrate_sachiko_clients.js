@@ -1,10 +1,16 @@
 /**
- * Migrate dealer clients (and their users) to the Sachiko collections.
+ * Migrate dealer clients (and their users) from the fairdesk DB into the
+ * separate `sachiko` database, writing to the STANDARD collections.
  *
- * - Copies `clients` where clientType = "DEALER" into `sachikoclients`
- *   with SP | CLIENT | 001 style IDs.
- * - Copies the associated `usernames` into `sachikoclientusers`, updating
- *   clientId to the new SP ID.
+ * - Reads `clients` (clientType = "DEALER") from the source (fairdesk) DB and
+ *   writes them into `clients` in the target (sachiko) DB with
+ *   SP | CLIENT | 001 style IDs.
+ * - Reads the associated `usernames` from the source DB and writes them into
+ *   `usernames` in the target DB, updating clientId to the new SP ID.
+ *
+ * Source DB : process.env.MONGO_URI            (defaults to .../fairdesk)
+ * Target DB : process.env.SACHIKO_MONGO_URI    (defaults to source URI with
+ *             the database name swapped to "sachiko")
  *
  * Usage:
  *   node scripts/migrate_sachiko_clients.js           -- dry run (no writes)
@@ -16,8 +22,17 @@ import { configDotenv } from "dotenv";
 
 configDotenv({ quiet: true });
 
-const MONGO_URI =
+/** Swap the database name in a mongodb connection string. */
+function withDbName(uri, dbName) {
+  return uri.replace(
+    /(\/\/[^/]+\/)([^?]*)(\?.*)?$/,
+    (_m, pre, _db, query = "") => `${pre}${dbName}${query || ""}`,
+  );
+}
+
+const SOURCE_URI =
   process.env.MONGO_URI || "mongodb://admin:YourStrongPassword@127.0.0.1:27017/fairdesk?authSource=admin";
+const TARGET_URI = process.env.SACHIKO_MONGO_URI || withDbName(SOURCE_URI, "sachiko");
 
 /* ── inline schema definitions ── */
 
@@ -25,7 +40,6 @@ const counterSchema = new mongoose.Schema({
   key: { type: String, required: true, unique: true },
   seq: { type: Number, required: true, default: 0 },
 });
-const Counter = mongoose.models.Counter || mongoose.model("Counter", counterSchema);
 
 const clientSchema = new mongoose.Schema({
   clientId: String,
@@ -39,26 +53,11 @@ const clientSchema = new mongoose.Schema({
   clientGumasta: String,
   clientPan: String,
   clientSignature: String,
-});
-const Client = mongoose.models.Client || mongoose.model("Client", clientSchema, "clients");
-
-const sachikoClientSchema = new mongoose.Schema({
-  clientId: { type: String, required: true, unique: true },
-  clientName: String,
-  clientType: String,
-  clientStatus: String,
-  hoLocation: String,
-  accountHead: String,
-  clientGst: String,
-  clientMsme: String,
-  clientGumasta: String,
-  clientPan: String,
-  clientSignature: { type: String, sparse: true },
+  // binding to the client's users (what the app populates)
+  users: [{ type: mongoose.Schema.Types.ObjectId, ref: "Username" }],
+  // tracking field for idempotency (only set on migrated docs)
   sourceClientId: String,
 });
-const SachikoClient =
-  mongoose.models.SachikoClient ||
-  mongoose.model("SachikoClient", sachikoClientSchema, "sachikoclients");
 
 const usernameSchema = new mongoose.Schema({
   clientId: String,
@@ -90,64 +89,15 @@ const usernameSchema = new mongoose.Schema({
   clientGumasta: String,
   clientPan: String,
   userSignature: String,
-});
-const Username =
-  mongoose.models.Username || mongoose.model("Username", usernameSchema, "usernames");
-
-const sachikoClientUserSchema = new mongoose.Schema({
-  clientId: String,
-  clientName: String,
-  clientType: String,
-  hoLocation: String,
-  accountHead: String,
-  userName: String,
-  userLocation: String,
-  userDepartment: String,
-  userContact: String,
-  userEmail: String,
-  dispatchAddress: String,
-  locationsCount: Number,
-  locationDetails: [{ userLocation: String, dispatchAddress: String }],
-  transportName: String,
-  transportContact: String,
-  dropLocation: String,
-  deliveryMode: String,
-  deliveryLocation: String,
-  clientPayment: String,
-  SelfDispatch: String,
-  clientStatus: String,
-  ownerName: String,
-  ownerMobNo: String,
-  ownerEmail: String,
-  clientGst: String,
-  clientMsme: String,
-  clientGumasta: String,
-  clientPan: String,
-  userSignature: { type: String, sparse: true },
+  // tracking fields for idempotency (only set on migrated docs)
   sourceUserId: String,
   sourceClientId: String,
 });
-const SachikoClientUser =
-  mongoose.models.SachikoClientUser ||
-  mongoose.model("SachikoClientUser", sachikoClientUserSchema, "sachikoclientusers");
 
 /* ── helpers ── */
 
 function padSeq(n) {
   return String(n).padStart(3, "0");
-}
-
-async function nextSachikoClientId() {
-  const counter = await Counter.findOneAndUpdate(
-    { key: "sachiko_clientId" },
-    { $inc: { seq: 1 } },
-    { upsert: true, new: true },
-  );
-  let seq = counter.seq;
-  while (await SachikoClient.exists({ clientId: `SP | CLIENT | ${padSeq(seq)}` })) {
-    seq += 1;
-  }
-  return `SP | CLIENT | ${padSeq(seq)}`;
 }
 
 /* ── main ── */
@@ -157,17 +107,42 @@ async function main() {
 
   console.log("\n  Sachiko Client Migration");
   console.log("  Mode:", applyMode ? "APPLY" : "DRY-RUN (pass --apply to write)");
-  console.log("  Connecting to:", MONGO_URI, "\n");
+  console.log("  Source (read) :", SOURCE_URI);
+  console.log("  Target (write):", TARGET_URI, "\n");
 
-  await mongoose.connect(MONGO_URI);
+  const sourceConn = await mongoose.createConnection(SOURCE_URI).asPromise();
+  const targetConn = await mongoose.createConnection(TARGET_URI).asPromise();
   console.log("  Connected.\n");
 
+  // Source models (fairdesk DB)
+  const Client = sourceConn.model("Client", clientSchema, "clients");
+  const Username = sourceConn.model("Username", usernameSchema, "usernames");
+
+  // Target models (sachiko DB) — standard collection names
+  const TargetClient = targetConn.model("Client", clientSchema, "clients");
+  const TargetUsername = targetConn.model("Username", usernameSchema, "usernames");
+  const Counter = targetConn.model("Counter", counterSchema);
+
+  async function nextClientId() {
+    const counter = await Counter.findOneAndUpdate(
+      { key: "sachiko_clientId" },
+      { $inc: { seq: 1 } },
+      { upsert: true, new: true },
+    );
+    let seq = counter.seq;
+    while (await TargetClient.exists({ clientId: `SP | CLIENT | ${padSeq(seq)}` })) {
+      seq += 1;
+    }
+    return `SP | CLIENT | ${padSeq(seq)}`;
+  }
+
   const dealers = await Client.find({ clientType: "DEALER" }).lean();
-  console.log(`  Found ${dealers.length} DEALER client(s) in the clients collection.\n`);
+  console.log(`  Found ${dealers.length} DEALER client(s) in the source clients collection.\n`);
 
   if (dealers.length === 0) {
     console.log("  Nothing to migrate.");
-    await mongoose.disconnect();
+    await sourceConn.close();
+    await targetConn.close();
     process.exit(0);
   }
 
@@ -177,15 +152,15 @@ async function main() {
   let usersSkipped = 0;
 
   for (const dealer of dealers) {
-    const existing = await SachikoClient.findOne({ sourceClientId: dealer.clientId }).lean();
+    const existing = await TargetClient.findOne({ sourceClientId: dealer.clientId }).lean();
 
     if (existing) {
-      console.log(`  SKIP  "${dealer.clientName}" — already in sachikoclients as ${existing.clientId}`);
+      console.log(`  SKIP  "${dealer.clientName}" — already in target clients as ${existing.clientId}`);
       clientsSkipped++;
 
       const clientUsers = await Username.find({ clientId: dealer.clientId }).lean();
       for (const u of clientUsers) {
-        const userExisting = await SachikoClientUser.findOne({ sourceUserId: String(u._id) }).lean();
+        const userExisting = await TargetUsername.findOne({ sourceUserId: String(u._id) }).lean();
         if (userExisting) {
           usersSkipped++;
         } else {
@@ -197,7 +172,7 @@ async function main() {
     }
 
     const newId = applyMode
-      ? await nextSachikoClientId()
+      ? await nextClientId()
       : `SP | CLIENT | ${padSeq(clientsCreated + 1)}`;
 
     const clientUsers = await Username.find({ clientId: dealer.clientId }).lean();
@@ -210,28 +185,14 @@ async function main() {
     console.log(`    Location  : ${dealer.hoLocation}`);
     console.log(`    Users     : ${clientUsers.length}`);
 
-    if (applyMode) {
-      await SachikoClient.create({
-        clientId: newId,
-        clientName: dealer.clientName,
-        clientType: dealer.clientType,
-        clientStatus: dealer.clientStatus,
-        hoLocation: dealer.hoLocation,
-        accountHead: dealer.accountHead,
-        clientGst: dealer.clientGst,
-        clientMsme: dealer.clientMsme,
-        clientGumasta: dealer.clientGumasta,
-        clientPan: dealer.clientPan,
-        clientSignature: dealer.clientSignature || undefined,
-        sourceClientId: dealer.clientId,
-      });
-    }
-    clientsCreated++;
-
+    // Create the users first so we can collect their _ids and bind them to the
+    // client via the `users` array (which is what the app populates).
+    const createdUserIds = [];
     for (const u of clientUsers) {
-      const userExisting = await SachikoClientUser.findOne({ sourceUserId: String(u._id) }).lean();
+      const userExisting = await TargetUsername.findOne({ sourceUserId: String(u._id) }).lean();
       if (userExisting) {
         console.log(`      SKIP user "${u.userName}" — already migrated`);
+        createdUserIds.push(userExisting._id);
         usersSkipped++;
         continue;
       }
@@ -239,7 +200,7 @@ async function main() {
       console.log(`      ${applyMode ? "CREATE" : "WOULD CREATE"} user  "${u.userName}"  (${u.userLocation})`);
 
       if (applyMode) {
-        await SachikoClientUser.create({
+        const createdUser = await TargetUsername.create({
           clientId: newId,
           clientName: dealer.clientName,
           clientType: dealer.clientType,
@@ -272,9 +233,29 @@ async function main() {
           sourceUserId: String(u._id),
           sourceClientId: dealer.clientId,
         });
+        createdUserIds.push(createdUser._id);
       }
       usersCreated++;
     }
+
+    if (applyMode) {
+      await TargetClient.create({
+        clientId: newId,
+        clientName: dealer.clientName,
+        clientType: dealer.clientType,
+        clientStatus: dealer.clientStatus,
+        hoLocation: dealer.hoLocation,
+        accountHead: dealer.accountHead,
+        clientGst: dealer.clientGst,
+        clientMsme: dealer.clientMsme,
+        clientGumasta: dealer.clientGumasta,
+        clientPan: dealer.clientPan,
+        clientSignature: dealer.clientSignature || undefined,
+        users: createdUserIds,
+        sourceClientId: dealer.clientId,
+      });
+    }
+    clientsCreated++;
     console.log("");
   }
 
@@ -289,7 +270,8 @@ async function main() {
     console.log("\n  Run with --apply to write these records to the database.");
   }
 
-  await mongoose.disconnect();
+  await sourceConn.close();
+  await targetConn.close();
   console.log("\n  Done.\n");
   process.exit(0);
 }

@@ -72,4 +72,4 @@ server.js     Application entry point
 
 ## License
 
-ISC
+EULA

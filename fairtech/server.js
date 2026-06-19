@@ -235,13 +235,8 @@ app.get("/check-session", (req, res) => {
   return res.status(401).json({ authenticated: false });
 });
 
-/* Apply CSRF protection to ALL routes (except login POST for debugging) */
-app.use((req, res, next) => {
-  if (req.path === "/login" && req.method === "POST") {
-    return next();
-  }
-  csrfProtection(req, res, next);
-});
+/* Apply CSRF protection to ALL routes */
+app.use(csrfProtection);
 app.use((req, res, next) => {
   res.locals.csrfToken = typeof req.csrfToken === "function" ? req.csrfToken() : "";
   next();

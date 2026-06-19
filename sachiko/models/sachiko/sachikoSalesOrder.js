@@ -33,7 +33,7 @@ const sachikoSalesOrderSchema = new mongoose.Schema(
 const SachikoSalesOrder = mongoose.model(
   "SachikoSalesOrder",
   sachikoSalesOrderSchema,
-  "sachikosalesorders",
+  "salesorders",
 );
 
 export default SachikoSalesOrder;
